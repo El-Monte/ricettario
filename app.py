@@ -4,6 +4,7 @@ import google.generativeai as genai
 import os
 from dotenv import load_dotenv
 import numpy as np
+import time
 from sklearn.metrics.pairwise import cosine_similarity
 
 # 1. Config & Setup
@@ -37,6 +38,18 @@ def find_top_recipes(dataframe, user_query, top_k=6):
     
     # Generate embedding for the query
     model = "models/text-embedding-004"
+    query_embedding = None
+    for attempt in range(3):
+        try:
+            # Try to connect to Google
+            query_embedding = genai.embed_content(model=model, content=user_query)['embedding']
+            break # If successful, stop looping
+        except Exception as e:
+            # If it fails, wait 1 second and try again
+            time.sleep(1)
+            if attempt == 2: # If it's the last attempt, crash nicely
+                st.error("Errore di connessione con Google. Riprova tra poco.")
+                return pd.DataFrame() # Return empty if failed
     query_embedding = genai.embed_content(model=model, content=user_query)['embedding']
     
     # Calculate similarity
