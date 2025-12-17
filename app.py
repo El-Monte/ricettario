@@ -2,169 +2,152 @@ import streamlit as st
 import pandas as pd
 import google.generativeai as genai
 import os
+import time
 from dotenv import load_dotenv
 import numpy as np
-import time
 from sklearn.metrics.pairwise import cosine_similarity
 
-# 1. Config & Setup
+# 1. Config
 load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-st.set_page_config(page_title="Le Ricette della Mamma", page_icon="🍝")
+st.set_page_config(
+    page_title="La Cucina di Mamma", 
+    page_icon="🍝",
+    layout="centered"
+)
 
-# --- MEMORY SETUP (Session State) ---
-# This "backpack" holds data so we don't lose it
+# --- MEMORY ---
 if "history" not in st.session_state:
-    st.session_state.history = [] # Stores the chat conversation
-if "current_recipes" not in st.session_state:
-    st.session_state.current_recipes = None # Stores the recipes found
-if "context_text" not in st.session_state:
-    st.session_state.context_text = "" # Stores the text we sent to the AI
+    st.session_state.history = []
+if "selected_recipe" not in st.session_state:
+    st.session_state.selected_recipe = None
 
-# 2. Load Data (Cached for speed)
+# 2. Load Data
 @st.cache_data
 def load_data():
     if not os.path.exists('recipes_embeddings.pkl'):
-        st.error("File embeddings non trovato. Esegui create_embeddings.py!")
         return pd.DataFrame()
     return pd.read_pickle('recipes_embeddings.pkl')
 
 df_original = load_data()
 
 # 3. Search Logic
-def find_top_recipes(dataframe, user_query, top_k=6):
-    if dataframe.empty: return dataframe
+def search_recipes(dataframe, user_query):
+    if dataframe.empty: return None
     
-    # Generate embedding for the query
     model = "models/text-embedding-004"
     query_embedding = None
+    
     for attempt in range(3):
         try:
-            # Try to connect to Google
             query_embedding = genai.embed_content(model=model, content=user_query)['embedding']
-            break # If successful, stop looping
-        except Exception as e:
-            # If it fails, wait 1 second and try again
+            break
+        except:
             time.sleep(1)
-            if attempt == 2: # If it's the last attempt, crash nicely
-                st.error("Errore di connessione con Google. Riprova tra poco.")
-                return pd.DataFrame() # Return empty if failed
-    query_embedding = genai.embed_content(model=model, content=user_query)['embedding']
-    
-    # Calculate similarity
+            
+    if query_embedding is None: return None
+
     data_embeddings = np.stack(dataframe['embedding'].values)
     scores = cosine_similarity([query_embedding], data_embeddings)[0]
     
-    # Get top results
-    real_k = min(top_k, len(dataframe))
-    top_indices = scores.argsort()[-real_k:][::-1]
-    return dataframe.iloc[top_indices]
+    best_index = np.argmax(scores)
+    return dataframe.iloc[best_index]
 
-# 4. AI Generation Logic (The Chef)
-def talk_to_chef(prompt_text):
+# 4. AI Logic
+def ask_ai(prompt_text):
     model = genai.GenerativeModel('gemini-2.5-flash')
     response = model.generate_content(prompt_text)
     return response.text
 
-# --- MAIN INTERFACE ---
-st.title("🍝 Le Ricette della Mamma")
+# --- 🎨 THE "HOMEY" INTERFACE ---
 
-# Sidebar Filters
-st.sidebar.header("Filtri")
-max_time = st.sidebar.slider("Tempo massimo (minuti)", 10, 120, 120)
+# Custom Title with Color (Tomato Red)
+st.markdown("<h1 style='text-align: center; color: #E63946;'>🍝 La Cucina di Mamma</h1>", unsafe_allow_html=True)
+st.markdown("<h4 style='text-align: center; color: #555;'>Cosa cuciniamo di buono oggi?</h4>", unsafe_allow_html=True)
+st.write("") # Spacer
 
-# Filter Data
+# Sidebar Filters (Hidden slightly to keep main view clean)
+with st.sidebar:
+    st.header("⚙️ Impostazioni")
+    max_time = st.slider("Quanto tempo hai? (min)", 10, 120, 120)
+    st.caption("Filtra le ricette troppo lunghe.")
+
 if not df_original.empty:
     df_filtered = df_original[df_original['Time'] <= max_time]
 else:
     df_filtered = pd.DataFrame()
 
-# --- SECTION 1: SEARCH (The RAG Part) ---
-st.markdown("### 1. Cerca una ricetta")
-user_ingredients = st.text_input("Cosa hai nel frigo?", placeholder="Es: zucchine, uova, tofu...")
+# --- SEARCH BAR (Centered & Clean) ---
+col1, col2, col3 = st.columns([1, 6, 1])
+with col2:
+    user_ingredients = st.text_input("📝 Dimmi gli ingredienti:", placeholder="Es: ho delle zucchine e uova...")
+    search_btn = st.button("🍳 Trova la Ricetta", use_container_width=True, type="primary")
 
-if st.button("Trova Ricetta"):
+if search_btn:
     if user_ingredients:
-        with st.spinner("Consulto il ricettario..."):
-            # A. Search
-            top_recipes = find_top_recipes(df_filtered, user_ingredients)
+        with st.spinner("Sfoglio il quaderno delle ricette..."):
+            best_recipe = search_recipes(df_filtered, user_ingredients)
             
-            if top_recipes.empty:
-                st.warning("Nessuna ricetta trovata con questi filtri.")
+            if best_recipe is not None:
+                st.session_state.selected_recipe = best_recipe
+                st.session_state.history = [] # Reset chat
             else:
-                # B. Save Context to Memory (So the Chat knows what we are talking about)
-                st.session_state.current_recipes = top_recipes
-                
-                # Create a string representation of the recipes for the AI
-                context_str = ""
-                for index, row in top_recipes.iterrows():
-                    context_str += f"- {row['Title']} ({row['Time']} min): {row['Ingredients']} (Istruzioni: {row['Instructions']})\n"
-                st.session_state.context_text = context_str
-                
-                # C. Initial Prompt to the Chef
-                initial_prompt = f"""
-                Sei uno chef italiano esperto e creativo.
-                L'utente ha questi ingredienti: "{user_ingredients}".
-                
-                Ecco le ricette che ho trovato nel database (potrebbero non essere tutte pertinenti):
-                {context_str}
-                
-                IL TUO COMPITO:
-                1. Analizza gli ingredienti dell'utente. Stanno bene insieme?
-                2. SE STANNO BENE INSIEME: Scegli la ricetta migliore dal database e spiegala.
-                3. SE NON STANNO BENE INSIEME (es. "cioccolato e tonno"):
-                   - Non forzare un mix disgustoso!
-                   - Proponi DUE ricette separate (una per il primo ingrediente, una per il secondo).
-                   - OPPURE, se sei creativo, proponi un abbinamento "gourmet" inaspettato ma avverti l'utente che è un esperimento.
-                
-                Usa un tono simpatico e dai del "tu".
-                Finisci con il dire: "Buon appetito Castagnetta!"
-                """
-                
-                # D. Generate and Save to History
-                response_text = talk_to_chef(initial_prompt)
-                
-                # Reset history for a new search
-                st.session_state.history = []
-                st.session_state.history.append({"role": "assistant", "content": response_text})
+                st.error("Non ho trovato nulla! Prova con altri ingredienti.")
 
-# --- SECTION 2: DISPLAY & CHAT (The Memory Part) ---
-# If we have a search result in memory, show it
-if st.session_state.current_recipes is not None:
+# --- DISPLAY RESULT (The Pretty Part) ---
+if st.session_state.selected_recipe is not None:
+    rec = st.session_state.selected_recipe
     
-    # 1. Show the "Best Match" Table
-    best = st.session_state.current_recipes.iloc[0]
-    st.info(f"💡 Suggerimento Top: **{best['Title']}** ({best['Time']} min)")
+    st.markdown("---") # Divider line
     
-    # 2. Show Chat History
-    for message in st.session_state.history:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    # Recipe Header
+    st.markdown(f"<h2 style='text-align: center; color: #2A9D8F;'>✨ {rec['Title']}</h2>", unsafe_allow_html=True)
+    st.markdown(f"<p style='text-align: center;'>⏱️ <b>Tempo:</b> {rec['Time']} minuti</p>", unsafe_allow_html=True)
+    
+    # Layout: Ingredients Left, Instructions Right
+    col_left, col_right = st.columns([1, 1.5], gap="large")
+    
+    with col_left:
+        st.info("🛒 **Ingredienti**")
+        # Turn comma-separated string into a nice bullet list
+        ingredients_list = rec['Ingredients'].split(',')
+        for ing in ingredients_list:
+            st.markdown(f"- {ing.strip()}")
             
-    # 3. User Chat Input (Follow-up questions)
-    if prompt := st.chat_input("Dubbi? Chiedi allo chef (Es: posso usare il burro?)"):
+    with col_right:
+        st.success("🔥 **Preparazione**")
+        st.write(rec['Instructions'])
+    
+    st.markdown("---")
+    
+    # --- CHAT BOT SECTION ---
+    st.markdown("#### 👩‍🍳 L'Angolo dello Chef")
+    st.caption("Hai dubbi sulla preparazione? Chiedi qui sotto!")
+    
+    # Chat container
+    chat_container = st.container(border=True)
+    with chat_container:
+        for message in st.session_state.history:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+            
+    # Input area
+    if prompt := st.chat_input("Es: Posso usare il burro invece dell'olio?"):
         
-        # Add user message to history
+        # User message
         st.session_state.history.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        with chat_container:
+            with st.chat_message("user"):
+                st.markdown(prompt)
             
-        # Generate Assistant Response
-        with st.chat_message("assistant"):
-            with st.spinner("Lo chef risponde..."):
-                # We send the previous context + the new question
-                full_prompt = f"""
-                Contesto Ricette:
-                {st.session_state.context_text}
-                
-                Domanda dell'utente: "{prompt}"
-                
-                Rispondi basandoti SULLA RICETTA di cui stiamo parlando. Sii breve.
-                """
-                
-                response = talk_to_chef(full_prompt)
-                st.markdown(response)
-                
-        # Add assistant response to history
+            # AI Reply
+            with st.chat_message("assistant"):
+                with st.spinner("Sto scrivendo..."):
+                    context = f"Ricetta: {rec['Title']}. Istruzioni: {rec['Instructions']}."
+                    full_prompt = f"Contesto: {context}\nDomanda Mamma: {prompt}\nRispondi in modo gentile e breve in italiano."
+                    
+                    response = ask_ai(full_prompt)
+                    st.markdown(response)
+        
         st.session_state.history.append({"role": "assistant", "content": response})
