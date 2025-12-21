@@ -3,7 +3,7 @@ import pandas as pd
 import google.generativeai as genai
 import os
 import time
-import random  # <--- Added for "Surprise Me"
+import re # Added for better text cleaning
 from dotenv import load_dotenv
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
@@ -16,14 +16,18 @@ st.set_page_config(
     page_title="La Cucina di Mamma", 
     page_icon="🍝",
     layout="centered",
-    initial_sidebar_state="collapsed" # Hide sidebar to make it cleaner on phone
+    initial_sidebar_state="collapsed"
 )
 
 # --- MEMORY ---
 if "history" not in st.session_state:
     st.session_state.history = []
+if "view_mode" not in st.session_state:
+    st.session_state.view_mode = "search" # 'search' or 'recipe_detail'
 if "selected_recipe" not in st.session_state:
     st.session_state.selected_recipe = None
+if "search_results" not in st.session_state:
+    st.session_state.search_results = None
 
 # 2. Load Data
 @st.cache_data
@@ -34,15 +38,15 @@ def load_data():
 
 df_original = load_data()
 
-# 3. SMART HYBRID SEARCH (Vector + Keyword Check)
+# 3. ROBUST SEARCH (Returns Top 3)
 def search_recipes(dataframe, user_query):
-    if dataframe.empty: return None
+    if dataframe.empty: return pd.DataFrame()
     
-    # A. Handle "Surprise Me"
+    # Handle "Surprise Me"
     if user_query == "SURPRISE_ME":
-        return dataframe.sample(1).iloc[0]
+        return dataframe.sample(3) # Return 3 random ones
 
-    # B. Get Vector Embeddings (The "Meaning" Search)
+    # Vector Search
     model = "models/text-embedding-004"
     query_embedding = None
     for attempt in range(3):
@@ -51,131 +55,150 @@ def search_recipes(dataframe, user_query):
             break
         except:
             time.sleep(1)
-    
-    if query_embedding is None: return None
+            
+    if query_embedding is None: return pd.DataFrame()
 
-    # C. Calculate Vector Scores
     data_embeddings = np.stack(dataframe['embedding'].values)
     vector_scores = cosine_similarity([query_embedding], data_embeddings)[0]
     
-    # --- D. THE FIX: Keyword Boosting ---
-    # We create a copy so we don't mess up the original data
+    # Hybrid Scoring
     candidates = dataframe.copy()
     candidates['vector_score'] = vector_scores
     
-    # 1. Split user query into words (e.g., "uova", "zucchine")
-    user_words = user_query.lower().split()
+    # Better text cleaning
+    # Remove commas and common Italian stop words
+    clean_query = re.sub(r'[^\w\s]', '', user_query.lower()) # remove punctuation
+    stop_words = ["e", "con", "il", "di", "la", "ho", "delle"]
+    user_words = [w for w in clean_query.split() if w not in stop_words]
     
-    # 2. Count how many user words appear in the Ingredients column
     def count_matches(row):
         ingredients = row['Ingredients'].lower()
         title = row['Title'].lower()
         score = 0
         for word in user_words:
-            # We remove the last letter to handle plurals roughly (uova/uovo)
-            # e.g., "zucchine" -> "zucchin" matches "zucchina"
-            clean_word = word[:-1] if len(word) > 3 else word
-            
-            if clean_word in ingredients or clean_word in title:
-                score += 1 
+            # Check if the word (or singular version) exists
+            if word in ingredients or word in title:
+                score += 1
+            elif len(word) > 4 and word[:-1] in ingredients: # simple plural check
+                score += 1
         return score
 
     candidates['keyword_score'] = candidates.apply(count_matches, axis=1)
     
-    # E. Final Sort
-    # Priority 1: Who has the most matching keywords?
-    # Priority 2: Who has the best vector math score?
+    # Sort: Keywords first, then Context
     best_matches = candidates.sort_values(
         by=['keyword_score', 'vector_score'], 
         ascending=[False, False]
     )
     
-    # Return the absolute winner
-    return best_matches.iloc[0]
+    # Return TOP 3
+    return best_matches.head(3)
 
-# --- 🎨 THE INTERFACE ---
+# 4. AI Logic
+def ask_ai(prompt_text):
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    response = model.generate_content(prompt_text)
+    return response.text
 
-st.markdown("<h1 style='text-align: center; color: #E63946;'>🍝 La Cucina di Mamma</h1>", unsafe_allow_html=True)
-st.markdown("<p style='text-align: center; color: #666;'>Ricette buone, sane e veloci.</p>", unsafe_allow_html=True)
+# --- 🎨 INTERFACE ---
 
-# --- QUICK TAGS (NEW FEATURE) ---
-# These buttons act like shortcuts
-st.write("")
-tags_cols = st.columns(4)
-query_from_tags = None
-
-if tags_cols[0].button("🥦 Veg", use_container_width=True):
-    query_from_tags = "verdure vegetariano leggero"
-if tags_cols[1].button("⚡ Veloce", use_container_width=True):
-    query_from_tags = "veloce facile rapido"
-if tags_cols[2].button("🍖 Carne", use_container_width=True):
-    query_from_tags = "carne pollo manzo"
-if tags_cols[3].button("🎲 Sorpresa", use_container_width=True):
-    query_from_tags = "SURPRISE_ME"
-
-# Sidebar
-with st.sidebar:
-    st.header("⚙️ Impostazioni")
-    max_time = st.slider("Tempo max (min)", 10, 180, 120)
-
-if not df_original.empty:
-    df_filtered = df_original[df_original['Time'] <= max_time]
+# Header
+if st.session_state.view_mode == "search":
+    st.markdown("<h1 style='text-align: center; color: #E63946;'>🍝 La Cucina di Mamma</h1>", unsafe_allow_html=True)
 else:
-    df_filtered = pd.DataFrame()
+    # Smaller header when looking at a recipe
+    if st.button("⬅️ Torna alla ricerca"):
+        st.session_state.view_mode = "search"
+        st.session_state.selected_recipe = None
+        st.rerun()
 
-# --- SEARCH BAR (Fixed with Form) ---
-# We use a Form so "Enter" key works automatically
-with st.form("search_form"):
-    col1, col2 = st.columns([4, 1])
-    with col1:
-        # We add 'key' to ensure unique ID
-        user_input_text = st.text_input("Ingrediente:", placeholder="Es: zucchine...", label_visibility="collapsed")
-    with col2:
-        # This button now reacts to the Enter key too
-        search_pressed = st.form_submit_button("🔍", type="primary")
-
-# LOGIC: Determine what to search for
-final_query = None
-
-# 1. Did she use the Form (Type + Enter/Click)?
-if search_pressed and user_input_text:
-    final_query = user_input_text
-
-# 2. OR Did she click a Quick Tag?
-elif query_from_tags:
-    final_query = query_from_tags
-
-# --- RUN SEARCH ---
-if final_query:
-    with st.spinner("Cerco l'ispirazione..."):
-        best_recipe = search_recipes(df_filtered, final_query)
-        if best_recipe is not None:
-            st.session_state.selected_recipe = best_recipe
-            st.session_state.history = [] # Reset chat
-        else:
-            st.error("Nessuna ricetta trovata!")
-
-# --- DISPLAY RESULT ---
-if st.session_state.selected_recipe is not None:
-    rec = st.session_state.selected_recipe
+# --- VIEW 1: SEARCH SCREEN ---
+if st.session_state.view_mode == "search":
     
-    st.markdown("---")
+    # Quick Tags
+    tags_cols = st.columns(4)
+    query_from_tags = None
+    if tags_cols[0].button("🥦 Veg", use_container_width=True): query_from_tags = "verdure vegetariano"
+    if tags_cols[1].button("⚡ Veloce", use_container_width=True): query_from_tags = "veloce facile"
+    if tags_cols[2].button("🍖 Carne", use_container_width=True): query_from_tags = "carne pollo manzo"
+    if tags_cols[3].button("🎲 Sorpresa", use_container_width=True): query_from_tags = "SURPRISE_ME"
+
+    # Search Bar
+    with st.form("search_form"):
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            user_input_text = st.text_input("Ingrediente:", placeholder="Es: zucchine...", label_visibility="collapsed")
+        with col2:
+            search_pressed = st.form_submit_button("🔍", type="primary")
+
+    # Sidebar Filter
+    with st.sidebar:
+        st.header("⚙️ Impostazioni")
+        max_time = st.slider("Tempo max (min)", 10, 180, 120)
+
+    # Determine Query
+    final_query = None
+    if search_pressed and user_input_text:
+        final_query = user_input_text
+    elif query_from_tags:
+        final_query = query_from_tags
+
+    # EXECUTE SEARCH
+    if final_query:
+        # Filter by time first
+        if not df_original.empty:
+            df_filtered = df_original[df_original['Time'] <= max_time]
+        else:
+            df_filtered = pd.DataFrame()
+            
+        with st.spinner("Cerco le opzioni migliori..."):
+            results = search_recipes(df_filtered, final_query)
+            
+            if not results.empty:
+                st.session_state.search_results = results
+            else:
+                st.error("Nessuna ricetta trovata!")
+
+    # DISPLAY RESULTS (Top 3 Cards)
+    if st.session_state.search_results is not None:
+        st.write("")
+        st.subheader("Ecco cosa ho trovato:")
+        
+        results = st.session_state.search_results
+        
+        # Loop through the top 3 results
+        for index, row in results.iterrows():
+            # Create a clickable card look using a button
+            # We use a container to make it look nice
+            with st.container(border=True):
+                col_text, col_btn = st.columns([3, 1])
+                with col_text:
+                    st.markdown(f"**{row['Title']}**")
+                    st.caption(f"⏱️ {row['Time']} min | 🛒 {row['Ingredients'][:50]}...")
+                with col_btn:
+                    # Unique key is needed for buttons in loops
+                    if st.button("Vedi", key=f"btn_{index}", use_container_width=True):
+                        st.session_state.selected_recipe = row
+                        st.session_state.view_mode = "recipe_detail"
+                        st.session_state.history = [] # Reset chat
+                        st.rerun()
+
+# --- VIEW 2: RECIPE DETAIL ---
+elif st.session_state.view_mode == "recipe_detail" and st.session_state.selected_recipe is not None:
+    rec = st.session_state.selected_recipe
     
     # Title Card
     st.markdown(f"""
-    <div style="background-color: #f0f2f6; padding: 20px; border-radius: 10px; text-align: center; border: 1px solid #ddd;">
+    <div style="background-color: #f9f9f9; padding: 15px; border-radius: 10px; text-align: center; border: 1px solid #ddd; margin-bottom: 20px;">
         <h2 style="color: #2A9D8F; margin:0;">{rec['Title']}</h2>
         <p style="margin-top: 5px;">⏱️ <b>{rec['Time']} min</b></p>
     </div>
     """, unsafe_allow_html=True)
     
-    st.write("") # Spacer
-
-    # Tab Layout (Cleaner than columns)
-    tab1, tab2, tab3 = st.tabs(["📝 Ricetta", "🛒 Lista Spesa", "💬 Chiedi allo Chef"])
+    # Tabs
+    tab1, tab2, tab3 = st.tabs(["📝 Ricetta", "🛒 Spesa", "💬 Chef"])
     
     with tab1:
-        # Ingredients & Steps
         col_a, col_b = st.columns([1, 1.5])
         with col_a:
             st.markdown("#### Ingredienti")
@@ -187,34 +210,26 @@ if st.session_state.selected_recipe is not None:
             st.write(rec['Instructions'])
 
     with tab2:
-        # SHOPPING LIST HELPER (NEW)
-        st.info("Copia questa lista per WhatsApp!")
-        
-        # Use AI to format it as a checkbox list
-        if st.button("Genera Lista Checklist"):
-            with st.spinner("Scrivo la lista..."):
-                prompt_list = f"Trasforma questi ingredienti in una lista della spesa con checkbox per WhatsApp (senza testo introduttivo): {rec['Ingredients']}"
-                checklist = ask_ai(prompt_list)
+        st.info("Lista per WhatsApp:")
+        if st.button("Crea Checklist"):
+            with st.spinner("Genero..."):
+                checklist = ask_ai(f"Lista spesa checkbox per: {rec['Ingredients']}")
                 st.code(checklist, language="markdown")
 
     with tab3:
-        # Chat
-        st.caption("Dubbi? Chiedi qui.")
-        chat_cont = st.container(height=300) # Scrollable container
+        chat_cont = st.container(height=300)
+        for msg in st.session_state.history:
+            with chat_cont.chat_message(msg["role"]):
+                st.markdown(msg["content"])
         
-        for message in st.session_state.history:
-            with chat_cont.chat_message(message["role"]):
-                st.markdown(message["content"])
-            
-        if prompt := st.chat_input("Es: Posso surgelarla?"):
+        if prompt := st.chat_input("Chiedi consiglio..."):
             st.session_state.history.append({"role": "user", "content": prompt})
             with chat_cont.chat_message("user"):
                 st.markdown(prompt)
             
             with chat_cont.chat_message("assistant"):
                 with st.spinner("..."):
-                    context = f"Ricetta: {rec['Title']}. Istruzioni: {rec['Instructions']}."
-                    full_prompt = f"Contesto: {context}\nDomanda: {prompt}\nRispondi brevemente."
-                    response = ask_ai(full_prompt)
-                    st.markdown(response)
-            st.session_state.history.append({"role": "assistant", "content": response})
+                    ctx = f"Ricetta: {rec['Title']}. Istruzioni: {rec['Instructions']}."
+                    resp = ask_ai(f"Contesto: {ctx}\nDomanda: {prompt}\nRispondi brevemente.")
+                    st.markdown(resp)
+            st.session_state.history.append({"role": "assistant", "content": resp})
